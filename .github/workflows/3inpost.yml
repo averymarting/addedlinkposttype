@@ -1,26 +1,19 @@
-name: Bluesky Auto Poster
-
+name: Bluesky Link Card Poster
 on:
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       account_row:
         description: >
-          OPTIONAL. Leave this blank to let the script auto-claim the next
-          free (not "In Use") row in Sheet1 and permanently bind it to this
-          repo (ASSIGNED_REPO / ASSIGNED_STATUS columns). Only fill this in
-          if you want to force this run onto one specific row number,
-          overriding auto-assignment (e.g. "3" = third data row after the
-          header). All other settings (ratios, hashtags, links, report,
-          etc.) live in Sheet1/Settings and are re-read every posting cycle.
+          OPTIONAL. Leave blank to auto-claim the next free Sheet1 row and
+          bind it to this repo permanently. Fill in only to force this run
+          onto a specific row number.
         required: false
         default: ""
-
 concurrency:
-  group: bluesky-poster
+  group: bluesky-linkcard-poster
   cancel-in-progress: false
-
 jobs:
   post:
     runs-on: ubuntu-latest
@@ -29,34 +22,18 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
-
-      - name: Run poster loop
-        run: python -u 3inpost.py
+      - name: Run link-card poster loop
+        run: python -u postnow_linkcard.py
         env:
           PYTHONUNBUFFERED: "1"
-          # Token URL is hardcoded inside 3inpost.py — nothing
-          # to configure here.
-          #
-          # IMPORTANT: no "|| '1'" fallback here on purpose. If neither a
-          # manual input nor a repo variable is set, ACCOUNT_ROW resolves to
-          # an EMPTY string, which the script treats as "not explicitly
-          # set" -> it falls through to auto-assignment (claims the first
-          # free row and remembers it for this repo forever after).
-          #
-          # If you want to permanently pin THIS repo to a specific row
-          # instead of relying on auto-assignment, set a repo variable:
-          #   Settings -> Secrets and variables -> Actions -> Variables
-          #   -> New repository variable -> ACCOUNT_ROW = 3
-          # A manual workflow_dispatch input, if filled in, wins over both.
+          # No "|| '1'" fallback on purpose — same reasoning as the media
+          # poster: an empty ACCOUNT_ROW means "auto-assign", not "row 1".
           ACCOUNT_ROW: ${{ github.event.inputs.account_row || vars.ACCOUNT_ROW }}
-
       - name: Disable workflow on permanent failure
         if: failure()
         run: gh workflow disable "${{ github.workflow }}"
