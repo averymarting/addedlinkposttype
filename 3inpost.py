@@ -70,7 +70,7 @@ GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 #               see LINK_PLAN_SHEET_ID below — or a tab in the master sheet)
 # ═══════════════════════════════════════════════════════════════════════════
 
-MASTER_SHEET_ID = "16mRifjcfs5rI1GBPlJwLf-g7qS-W9_uPY2A2DN-GtiQ"
+MASTER_SHEET_ID = "PUT_YOUR_MASTER_SHEET_ID_HERE"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 CREDS_RANGE     = f"{CREDS_TAB}!A:Z"
@@ -78,7 +78,7 @@ CREDS_RANGE     = f"{CREDS_TAB}!A:Z"
 # If your URL list lives in a SEPARATE spreadsheet from Sheet1/Settings,
 # put that spreadsheet's ID here. If it's just another tab in the SAME
 # spreadsheet as Sheet1, set this to MASTER_SHEET_ID instead.
-LINK_PLAN_SHEET_ID = "16mRifjcfs5rI1GBPlJwLf-g7qS-W9_uPY2A2DN-GtiQ"
+LINK_PLAN_SHEET_ID = "PUT_YOUR_LINK_PLAN_SHEET_ID_HERE"
 
 ASSIGN_STATUS_IN_USE = "In Use"
 POSTED_STATUS_VALUE  = "posted"
