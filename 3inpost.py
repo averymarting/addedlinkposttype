@@ -70,7 +70,7 @@ GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 #               see LINK_PLAN_SHEET_ID below — or a tab in the master sheet)
 # ═══════════════════════════════════════════════════════════════════════════
 
-MASTER_SHEET_ID = "PUT_YOUR_MASTER_SHEET_ID_HERE"
+MASTER_SHEET_ID = "16mRifjcfs5rI1GBPlJwLf-g7qS-W9_uPY2A2DN-GtiQ"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 CREDS_RANGE     = f"{CREDS_TAB}!A:Z"
