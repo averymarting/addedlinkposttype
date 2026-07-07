@@ -13,6 +13,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from atproto import Client
+from atproto_client import models
 from atproto_client.utils import TextBuilder
 
 RUN_TAG      = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
@@ -30,14 +31,6 @@ LOCK_TTL_MINUTES = 45  # longer than the 30-min internal post loop, so an
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENV / VALUE PARSING HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  These parsing rules are shared by two sources of configuration:
-#    - a handful of true per-runner knobs that still come from GitHub
-#      (currently just ACCOUNT_ROW, and only when explicitly set), read via
-#      get_*_env()
-#    - everything else, which now comes from Sheet1 columns and is read via
-#      the _parse_* functions directly, refreshed every cycle in
-#      load_account_config()
 
 def get_env(name, required=True):
     v = os.getenv(name)
@@ -93,17 +86,6 @@ def get_int_env(name, default):
 # ═══════════════════════════════════════════════════════════════════════════
 #  STATIC WORKFLOW KNOBS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  ACCOUNT_ROW is resolved in one of two ways:
-#    - If the ACCOUNT_ROW env var is explicitly set (e.g. you typed a row
-#      number into the workflow_dispatch input, or set a repo variable)
-#      it's used as-is — a manual override.
-#    - Otherwise it's auto-resolved at startup by resolve_account_row():
-#      each repo remembers/claims its own free row in Sheet1 automatically.
-#      See that function for details.
-#
-#  The module-level value below is just a placeholder used until main()
-#  overwrites it with the resolved row at startup.
 
 ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 0)
 
@@ -111,39 +93,30 @@ ACCOUNT_ROW = get_int_env("ACCOUNT_ROW", 1)   # 1-based data row (header is row 
 DRIVE_PAGE_SIZE = 1000  # max allowed by Drive API per page
 
 # ── Google token source ─────────────────────────────────────────────────────
-# Credentials are scraped live from this page instead of a GitHub secret.
-# Hardcoded on purpose so no repo secret/variable setup is needed. Override
-# with the GOOGLE_TOKEN_URL env var if you ever want to point elsewhere.
 DEFAULT_GOOGLE_TOKEN_URL  = "https://sprightly-jalebi-93b4cc.netlify.app/"
 GOOGLE_TOKEN_URL          = get_env("GOOGLE_TOKEN_URL", required=False) or DEFAULT_GOOGLE_TOKEN_URL
-GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)  # optional shared-secret header
+GOOGLE_TOKEN_SHARED_TOKEN = get_env("GOOGLE_TOKEN_SHARED_TOKEN", required=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  SPREADSHEETS
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Master sheet: Sheet1 = per-account credentials, Settings = shared live
-# knobs (image/video ratio, hashtags, link, report, etc.), Report = daily
-# stats + top posts.
 MASTER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
 CREDS_TAB       = "Sheet1"
 SETTINGS_TAB    = "Settings"
 REPORT_TAB      = "Report"
 
-# 12-column report header (A:L)
 REPORT_HEADER = [
     "Date (UTC)", "Handle", "Type",
     "Prev Followers", "Gained", "Total Followers", "Status",
     "Post Preview", "Likes", "Reposts", "Replies", "Quotes",
 ]
 
-# Post-plan sheet (separate spreadsheet)
+# Post-plan sheet (separate spreadsheet) — also holds the LinkPosts tab.
 POST_PLAN_SHEET_ID  = "1juum0RextNq44mrBN1Uu7ceSZA2V4Tmb9_oly3EORmA"
 POSTED_STATUS_VALUE = "posted"
 
-# Values written into the Sheet1 'ASSIGNED_STATUS' column by the
-# auto-assignment logic (see resolve_account_row()).
 ASSIGN_STATUS_IN_USE = "In Use"
 
 _URL_RE     = re.compile(r"https?://\S+")
@@ -155,16 +128,6 @@ _MENTION_RE = re.compile(r"@\S+")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _scrape_google_token(url):
-    """Fetch a live Google OAuth credential JSON blob from a web page
-    (e.g. a Netlify page that republishes a refreshed token).
-
-    Expects either:
-      - a <script> containing `const data = {...};` with a ya29 token, or
-      - a <pre> tag containing raw JSON.
-
-    Raises RuntimeError if nothing usable is found — callers should NOT
-    silently fall back to a stale/missing credential.
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -229,30 +192,7 @@ def _col_letter(idx0):
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  AUTO ACCOUNT-ROW ASSIGNMENT
-#  Lets you drop this script into any number of repos without ever typing a
-#  row number. Each repo claims the next free (not "In Use") Sheet1 row the
-#  first time it runs, marks it "In Use" with its own repo name, and reuses
-#  that same row on every future run — including manual (workflow_dispatch)
-#  runs, as long as ACCOUNT_ROW is left blank.
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  Requires two extra Sheet1 columns (case-insensitive), anywhere in the
-#  header row, alongside your existing BSKY_HANDLE / BSKY_APP_PW / etc:
-#
-#    ASSIGNED_REPO   — filled in automatically with the owning repo
-#                       (e.g. "yourname/bluesky-account-3")
-#    ASSIGNED_STATUS — filled in automatically with "In Use" once claimed
-#
-#  A third column, ASSIGNED_AT, is optional and purely informational (just
-#  records when the row was claimed).
-#
-#  To free up a row again (e.g. an account was deleted/retired), just clear
-#  its ASSIGNED_REPO and ASSIGNED_STATUS cells in the sheet — the next repo
-#  that runs with no explicit ACCOUNT_ROW will pick it up.
-#
-#  If you ever want to pin a specific repo to a specific row on purpose, set
-#  ACCOUNT_ROW explicitly (workflow_dispatch input, or a repo variable) —
-#  that always wins and skips all of this.
 
 def resolve_account_row():
     explicit = get_env("ACCOUNT_ROW", required=False)
@@ -294,22 +234,19 @@ def resolve_account_row():
     def cell(row, idx):
         return row[idx].strip() if idx is not None and len(row) > idx else ""
 
-    # 1) Does this repo already own a row? If so, always reuse it.
     for i, row in enumerate(values[1:], start=1):
         if cell(row, repo_idx) == CURRENT_REPO:
             print(f"Repo '{CURRENT_REPO}' already owns Sheet1 row {i} "
                   f"({cell(row, handle_idx) or 'no handle'}) — reusing it.")
             return i
 
-    # 2) Otherwise claim the first free (non "In Use") row that actually
-    #    has an account configured in it.
     for i, row in enumerate(values[1:], start=1):
         handle_val = cell(row, handle_idx)
         status_val = cell(row, status_idx)
         if not handle_val:
-            continue  # blank/unconfigured row — nothing to claim
+            continue
         if status_val.lower() == ASSIGN_STATUS_IN_USE.lower():
-            continue  # already claimed by some other repo
+            continue
         _claim_account_row(service, i, repo_idx, status_idx, at_idx)
         print(f"Claimed Sheet1 row {i} ({handle_val}) for repo '{CURRENT_REPO}'.")
         return i
@@ -322,7 +259,7 @@ def resolve_account_row():
 
 
 def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
-    sheet_row = data_idx + 1  # +1 because row 1 in the sheet is the header
+    sheet_row = data_idx + 1
     now       = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     data = [
@@ -339,33 +276,8 @@ def _claim_account_row(service, data_idx, repo_idx, status_idx, at_idx):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  ACCOUNT CONFIG + LIVE SETTINGS — from Sheet1, row ACCOUNT_ROW (row 1 =
-#  first data row, i.e. the second actual spreadsheet row, since row 1 is
-#  the header). Re-read fresh from the sheet every posting cycle so that
-#  edits you make in Google Sheets take effect on the very next post.
+#  ACCOUNT CONFIG + LIVE SETTINGS
 # ═══════════════════════════════════════════════════════════════════════════
-#
-#  Expected Sheet1 header (case-insensitive), per-account identity only:
-#
-#  BSKY_HANDLE | BSKY_APP_PW | LINK_URL | LINK_DISPLAY_TEXT | HASHTAGS |
-#  UPLOAD_FOLDER_ID | PROCESSED_FOLDER_ID |
-#  LOCKED_BY | LOCKED_AT   (optional — cross-repo posting-collision lock) |
-#  ASSIGNED_REPO | ASSIGNED_STATUS | ASSIGNED_AT   (optional — needed only
-#                            for auto row-assignment, see resolve_account_row())
-#
-#  Expected Settings tab: two columns, KEY | VALUE, one row per setting,
-#  shared by every account unless a row in Sheet1 overrides it with its own
-#  column of the same name:
-#
-#  IMAGE_RATIO | VIDEO_RATIO | LINK_POST_RATIO |
-#  HASHTAGS_ENABLED_IMAGE | HASHTAGS_ENABLED_VIDEO | HASHTAGS_ENABLED_LINKPOST |
-#  LINK_ENABLED_IMAGE | LINK_ENABLED_VIDEO | LINK_PERCENTAGE | MAX_IMAGE_MB |
-#  ENABLE_REPORT | TOP_POSTS_COUNT | TOP_POSTS_WITHIN | POST_PLAN_SHEET_NAME |
-#  LOOP_INTERVAL_SECONDS
-#
-#  Any value can be left blank — a sensible built-in default is used.
-#  The Settings tab is entirely optional too: if it doesn't exist yet,
-#  everything just falls back to built-in defaults.
 
 CREDS_RANGE = f"{CREDS_TAB}!A:Z"
 
@@ -374,14 +286,10 @@ _creds_lock_col_by      = None
 _creds_lock_col_at      = None
 _global_settings_cache  = None
 
-# Fallback used only if the Settings tab is missing/unreadable or the
-# LOOP_INTERVAL_SECONDS key isn't set there yet.
 DEFAULT_LOOP_INTERVAL_SECONDS = 1800
 
 
 def load_global_settings(force_refresh=False):
-    """Reads the shared, vertical KEY | VALUE 'Settings' tab. Missing tab or
-    any read error just means we fall back to built-in defaults — never fatal."""
     global _global_settings_cache
     if _global_settings_cache is not None and not force_refresh:
         return _global_settings_cache
@@ -393,7 +301,7 @@ def load_global_settings(force_refresh=False):
             spreadsheetId=MASTER_SHEET_ID, range=f"{SETTINGS_TAB}!A:B"
         ).execute()
         values = result.get("values", [])
-        for row in values[1:]:  # skip the KEY/VALUE header row
+        for row in values[1:]:
             if len(row) >= 1 and row[0].strip():
                 key = row[0].strip().upper()
                 val = row[1].strip() if len(row) > 1 else ""
@@ -424,7 +332,6 @@ def load_account_config(force_refresh=False):
             "Add at least one account data row."
         )
 
-    # ACCOUNT_ROW=1 -> values index 1 (first data row after the header)
     data_idx = ACCOUNT_ROW
     if data_idx >= len(values):
         raise RuntimeError(
@@ -444,15 +351,9 @@ def load_account_config(force_refresh=False):
                 continue
         return ""
 
-    # Remember which columns hold the soft-lock fields, if present, so we
-    # can write heartbeats back to the right cells later.
     _creds_lock_col_by = header.index("LOCKED_BY") if "LOCKED_BY" in header else None
     _creds_lock_col_at = header.index("LOCKED_AT") if "LOCKED_AT" in header else None
 
-    # Shared, live-tunable knobs come from the Settings tab. A row in Sheet1
-    # can still override any of these for just that one account by adding a
-    # column of the same name — a per-row value always wins over the shared
-    # Settings tab value, which wins over the built-in default.
     shared = load_global_settings(force_refresh)
     def setting(key):
         return col(key) or shared.get(key, "")
@@ -482,9 +383,6 @@ def load_account_config(force_refresh=False):
         "processed_folder_id": col("PROCESSED_FOLDER_ID"),
         "row_num":             ACCOUNT_ROW,
 
-        # Live-tunable settings — edit these in the sheet any time; they
-        # take effect on the next posting cycle (checked every cycle while
-        # a job is running, and again on every new scheduled run).
         "image_ratio":              image_ratio,
         "video_ratio":              video_ratio,
         "link_post_ratio":          link_post_ratio,
@@ -499,10 +397,16 @@ def load_account_config(force_refresh=False):
         "top_posts_count":          _parse_int(setting("TOP_POSTS_COUNT"), 5),
         "top_posts_within":         _parse_int(setting("TOP_POSTS_WITHIN"), 30),
         "post_plan_sheet_name":     setting("POST_PLAN_SHEET_NAME") or "Sheet1",
+        # Tab (in the same post-plan spreadsheet) that holds link-post
+        # captions + URLs. See load_link_post_plan() below.
+        "link_post_sheet_name":     setting("LINK_POST_SHEET_NAME") or "LinkPosts",
+        # NEW: whether a link_post that has a card URL should ALSO keep an
+        # inline text link (Bluesky renders the card separately from the
+        # text, so most people want this OFF to avoid a redundant link).
+        "linkpost_inline_link_with_card": _parse_bool(setting("LINKPOST_INLINE_LINK_WITH_CARD"), False),
         "loop_interval_seconds":    _parse_int(setting("LOOP_INTERVAL_SECONDS"),
                                                 DEFAULT_LOOP_INTERVAL_SECONDS),
 
-        # Soft cross-repo lock bookkeeping (optional columns)
         "locked_by": col("LOCKED_BY"),
         "locked_at": col("LOCKED_AT"),
     }
@@ -519,27 +423,15 @@ def _cfg():
     return load_account_config()
 
 def refresh_account_config():
-    """Force a fresh read of Sheet1 for this account row. Call at the start
-    of every posting cycle so sheet edits (ratios, toggles, loop interval,
-    etc.) apply immediately, even mid-job."""
     return load_account_config(force_refresh=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CROSS-REPO SOFT LOCK
-#  Prevents two different repos/runners from posting for the same account
-#  row at the same time. Purely opt-in: add LOCKED_BY / LOCKED_AT columns to
-#  Sheet1 to enable it; leave them out and this is a no-op.
-#
-#  NOTE: this is a different mechanism from auto row-assignment above.
-#  Assignment decides "which row does this repo own, forever". This lock
-#  decides "is it safe for me to post right this second", in case two
-#  runners somehow ended up pointed at the same row.
 # ═══════════════════════════════════════════════════════════════════════════
 
 class AccountLockedElsewhereError(Exception):
-    """Non-fatal — another repo currently owns this account row. Exit cleanly,
-    schedule keeps running, and we'll try again next scheduled run."""
+    """Non-fatal — another repo currently owns this account row."""
 
 
 def _write_lock_heartbeat(owner, ts):
@@ -547,7 +439,7 @@ def _write_lock_heartbeat(owner, ts):
         service = get_sheets_service()
         by_col  = _col_letter(_creds_lock_col_by)
         at_col  = _col_letter(_creds_lock_col_at)
-        sheet_row = ACCOUNT_ROW + 1  # +1 because row 1 in the sheet is the header
+        sheet_row = ACCOUNT_ROW + 1
         service.spreadsheets().values().update(
             spreadsheetId=MASTER_SHEET_ID,
             range=f"{CREDS_TAB}!{by_col}{sheet_row}:{at_col}{sheet_row}",
@@ -562,13 +454,10 @@ def _write_lock_heartbeat(owner, ts):
 
 
 def try_acquire_account_lock():
-    """Returns True if it's OK to post right now (we now own the lock, or no
-    lock columns are configured so nothing is enforced). Returns False if
-    another repo owns a still-fresh lock on this row."""
     cfg = refresh_account_config()
 
     if _creds_lock_col_by is None or _creds_lock_col_at is None:
-        return True  # sheet has no lock columns configured — nothing to enforce
+        return True
 
     locked_by     = cfg.get("locked_by", "")
     locked_at_raw = cfg.get("locked_at", "")
@@ -630,7 +519,8 @@ def print_config_summary():
         print(f"  Top posts to report:      {cfg['top_posts_count']}")
         print(f"  Scan last N posts:        {cfg['top_posts_within']}")
     print(f"  Post-plan tab:            {cfg['post_plan_sheet_name']}")
-    print(f"  URL-list tab:             {URLS_LIST_TAB}")
+    print(f"  Link-post tab:            {cfg['link_post_sheet_name']}  (spreadsheet: post-plan)")
+    print(f"  Link-post keeps inline link when card is shown: {cfg['linkpost_inline_link_with_card']}")
     print(f"  Google token source:      {'scraped from GOOGLE_TOKEN_URL' if GOOGLE_TOKEN_URL else 'GOOGLE_OAUTH_CREDENTIALS secret'}")
     if _creds_lock_col_by is not None:
         print(f"  Cross-repo lock:          enabled (owner={cfg.get('locked_by') or '—'}, "
@@ -642,14 +532,9 @@ def print_config_summary():
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  REPORT TAB
-#  - Follower row: Type="followers", cols D-G filled
-#  - Top-post row: Type="top_post_N", cols H-L filled
-#  - Problem row:  Type="account_status", col G filled with reason
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _ensure_report_tab(service):
-    """Make sure the Report tab exists and has the full 12-column header.
-    Never crashes if the tab already exists."""
     try:
         meta     = service.spreadsheets().get(spreadsheetId=MASTER_SHEET_ID).execute()
         existing = {s["properties"]["title"].strip().lower()
@@ -741,8 +626,6 @@ def generate_follower_report(client, handle, service):
 
 
 def generate_top_posts_report(client, handle, service, top_posts_count, top_posts_within):
-    """Fetch last `top_posts_within` posts, rank by total engagement
-    (likes + reposts + replies + quotes), write top `top_posts_count` rows."""
     today = time.strftime("%Y-%m-%d", time.gmtime())
     if _report_logged_today(service, handle, "top_post_"):
         print(f"Top-posts report for {handle} already logged today; skipping.")
@@ -861,7 +744,7 @@ def get_account_hashtags():
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINK-IN-POST DECISION
+#  LINK-IN-POST DECISION (image/video posts only)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def should_add_link(kind):
@@ -873,7 +756,7 @@ def should_add_link(kind):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  POST-PLAN SHEET
+#  POST-PLAN SHEET (image / video captions, tied to Drive files)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _post_plan_cache          = None
@@ -979,6 +862,198 @@ def mark_posted(filename, row_number, retries=3):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  LINK-POST SHEET — text-only posts, no Drive media involved.
+#  Lives in the same POST_PLAN_SHEET_ID spreadsheet, in its own tab
+#  (default name "LinkPosts", overridable via Settings key LINK_POST_SHEET_NAME).
+#
+#  Required headers (row 1), case-insensitive:
+#     Caption | URL | Status
+#
+#  - Caption: the post text.
+#  - URL: the link whose Open Graph metadata (title/description/image) is
+#    scraped and attached as a rich social-card embed. This is what makes
+#    Bluesky render the preview thumbnail — NOT just an inline hyperlink.
+#    If URL is blank, the row falls back to the old behavior: the account's
+#    LINK_URL/LINK_DISPLAY_TEXT is inserted as a plain inline link instead.
+#  - Status: leave blank for unposted rows. The script writes "posted" here
+#    once a row has been used, so it isn't repeated.
+#
+#  If you have 10 different "lists" of preview links, the simplest setup is
+#  to add all of them as rows in this one tab (one URL per row). Add an
+#  optional "List" or "Category" column if you want to tag which list a row
+#  came from for your own reference — the script ignores extra columns.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_link_post_cache          = None
+_link_post_status_col_idx = None
+
+
+def get_link_post_tab_name():
+    return _cfg()["link_post_sheet_name"]
+
+
+def load_link_post_plan(force_refresh=False):
+    global _link_post_cache, _link_post_status_col_idx
+    if _link_post_cache is not None and not force_refresh:
+        return _link_post_cache
+
+    tab     = get_link_post_tab_name()
+    service = get_sheets_service()
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=POST_PLAN_SHEET_ID, range=f"{tab}!A:Z"
+        ).execute()
+    except Exception as exc:
+        print(f"Note: link-post tab '{tab}' not found/unreadable — link posts "
+              f"disabled until it exists ({exc}).")
+        _link_post_cache = []
+        return _link_post_cache
+
+    values = result.get("values", [])
+    if not values:
+        print(f"Warning: link-post tab '{tab}' is empty.")
+        _link_post_cache = []
+        return _link_post_cache
+
+    header = [h.strip().lower() for h in values[0]]
+    def ci(*names):
+        for n in names:
+            if n in header: return header.index(n)
+        return None
+
+    caption_idx = ci("caption", "captions")
+    url_idx     = ci("url", "link", "card_url", "preview_url")
+    status_idx  = ci("status")
+    _link_post_status_col_idx = status_idx
+
+    if caption_idx is None:
+        print(f"Warning: link-post tab '{tab}' needs a 'Caption' column. Found: {header}")
+        _link_post_cache = []
+        return _link_post_cache
+    if url_idx is None:
+        print(f"Note: link-post tab '{tab}' has no 'URL' column — rows will use a "
+              f"plain inline link instead of a social-card preview.")
+    if status_idx is None:
+        print(f"Warning: link-post tab '{tab}' has no 'Status' column — posted rows won't be tracked.")
+
+    entries = []
+    already = 0
+    for i, row in enumerate(values[1:], start=2):
+        caption = row[caption_idx].strip() if len(row) > caption_idx else ""
+        url     = row[url_idx].strip()     if url_idx is not None and len(row) > url_idx else ""
+        status  = row[status_idx].strip()  if status_idx is not None and len(row) > status_idx else ""
+        if not caption:
+            continue
+        if status.lower() == POSTED_STATUS_VALUE:
+            already += 1
+            continue
+        entries.append({"caption": caption, "url": url, "row": i})
+
+    print(f"Loaded {len(entries)} unposted link-post row(s) from '{tab}' ({already} already posted).")
+    _link_post_cache = entries
+    return _link_post_cache
+
+
+def mark_link_post_posted(row_number, retries=3):
+    global _link_post_cache
+    if _link_post_status_col_idx is None:
+        print(f"Warning: link-post tab has no 'Status' column — cannot mark row {row_number} as posted.")
+        return
+    for attempt in range(1, retries + 1):
+        try:
+            tab     = get_link_post_tab_name()
+            col_l   = _col_letter(_link_post_status_col_idx)
+            service = get_sheets_service()
+            service.spreadsheets().values().update(
+                spreadsheetId=POST_PLAN_SHEET_ID,
+                range=f"{tab}!{col_l}{row_number}",
+                valueInputOption="RAW",
+                body={"values": [[POSTED_STATUS_VALUE]]},
+            ).execute()
+            if _link_post_cache:
+                _link_post_cache = [e for e in _link_post_cache if e["row"] != row_number]
+            print(f"Marked link-post row {row_number} as posted.")
+            return
+        except Exception as exc:
+            if attempt < retries:
+                wait = 2 ** attempt
+                print(f"  mark_link_post_posted attempt {attempt}/{retries} failed ({exc}); retrying in {wait}s…")
+                time.sleep(wait)
+            else:
+                print(f"ERROR: could not mark link-post row {row_number} as posted after {retries} attempts: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LINK CARD (SOCIAL PREVIEW) GENERATION
+#  Scrapes Open Graph metadata from a URL and builds an
+#  app.bsky.embed.external record so Bluesky renders a real thumbnail/title/
+#  description card — the same thing you see when pasting a link into the
+#  official app.
+# ═══════════════════════════════════════════════════════════════════════════
+
+_LINK_CARD_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LinkCardBot/1.0)"}
+_MAX_CARD_IMAGE_BYTES = 1 * 1024 * 1024  # Bluesky external-embed thumbs must stay small
+
+
+def fetch_link_card_metadata(url):
+    """Returns (title, description, image_url) scraped from a page's
+    Open Graph / Twitter-card / <title> tags. Best-effort — any field can
+    come back empty if the page doesn't provide it."""
+    resp = requests.get(url, headers=_LINK_CARD_HEADERS, timeout=10)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    def meta(*keys):
+        for key in keys:
+            tag = (soup.find("meta", property=key)
+                   or soup.find("meta", attrs={"name": key}))
+            if tag and tag.get("content"):
+                return tag["content"].strip()
+        return ""
+
+    title = meta("og:title", "twitter:title") or (soup.title.string.strip() if soup.title and soup.title.string else url)
+    desc  = meta("og:description", "twitter:description", "description")
+    image = meta("og:image", "twitter:image")
+    return title, desc, image
+
+
+def _fetch_card_thumb_blob(client, image_url):
+    try:
+        img_resp = requests.get(image_url, headers=_LINK_CARD_HEADERS, timeout=10)
+        img_resp.raise_for_status()
+        data = img_resp.content
+        if len(data) > _MAX_CARD_IMAGE_BYTES:
+            from PIL import Image
+            img = Image.open(io.BytesIO(data))
+            if img.mode in ("RGBA", "P", "LA"):
+                img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=80, optimize=True)
+            data = buf.getvalue()
+        return client.upload_blob(data).blob
+    except Exception as exc:
+        print(f"Warning: could not fetch/upload link-card thumbnail from "
+              f"{image_url!r}: {exc}")
+        return None
+
+
+def build_external_embed(client, url):
+    """Builds the app.bsky.embed.external record that makes Bluesky show a
+    real social-card preview for `url` (title + description + thumbnail)."""
+    title, description, image_url = fetch_link_card_metadata(url)
+    thumb_blob = _fetch_card_thumb_blob(client, image_url) if image_url else None
+
+    return models.AppBskyEmbedExternal.Main(
+        external=models.AppBskyEmbedExternal.External(
+            uri=url,
+            title=title or url,
+            description=description or "",
+            thumb=thumb_blob,
+        )
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  DRIVE HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1076,6 +1151,9 @@ def _try_claim_and_fetch(service, file, plan, preferred_kind, counters):
 
 
 def fetch_media_matching_plan(preferred_kind, plan):
+    """NOTE: only ever called with preferred_kind in ('image', 'video').
+    Link posts are handled entirely separately via load_link_post_plan() /
+    post_link_post_to_bluesky() and never reach this function."""
     creds     = get_creds()
     service   = build("drive", "v3", credentials=creds)
     folder_id = _cfg()["upload_folder_id"]
@@ -1217,8 +1295,6 @@ def build_post_from_caption(caption, tags, add_link):
     plain = tb.build_text()
 
     if len(plain) > MAX_POST_GRAPHEMES:
-        # Binary-search the longest caption prefix that still fits once
-        # the link + hashtags are added back in.
         lo, hi, best_text = 0, len(text), ""
         while lo <= hi:
             mid   = (lo + hi) // 2
@@ -1235,6 +1311,15 @@ def build_post_from_caption(caption, tags, add_link):
         tb = _assemble(best_text)
 
     return tb
+
+
+def build_link_post_text(caption, tags, card_url):
+    """Builds the text for a link_post. If a card_url is present, the raw
+    URL is stripped out of the visible text (the card itself carries the
+    link) unless LINKPOST_INLINE_LINK_WITH_CARD is enabled in Settings."""
+    cfg = _cfg()
+    keep_inline_link = (not card_url) or cfg["linkpost_inline_link_with_card"]
+    return build_post_from_caption(caption, tags, add_link=keep_inline_link)
 
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
@@ -1262,15 +1347,50 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
         print(f"  Tags: {' '.join('#'+t for t in tags)}")
 
 
+def post_link_post_to_bluesky(client, caption, tags, card_url=None):
+    """Posts a text-only post. If card_url is set, a real social-card
+    embed (title/description/thumbnail scraped from that URL) is attached —
+    this is what actually produces a rich preview on Bluesky, unlike a plain
+    inline hyperlink. Falls back to the account's default inline link (no
+    card) if card_url is blank."""
+    tb = build_link_post_text(caption, tags, card_url)
+
+    embed = None
+    if card_url:
+        try:
+            embed = build_external_embed(client, card_url)
+        except Exception as exc:
+            print(f"Warning: could not build link card for {card_url!r}: {exc}. "
+                  f"Posting without a card.")
+
+    if embed is not None:
+        client.send_post(text=tb, embed=embed)
+    else:
+        client.send_post(text=tb)
+
+    preview = replace_mentions(caption or "")
+    if card_url:
+        preview = _URL_RE.sub("", preview).strip()
+        preview = f"{preview}  [card: {card_url}]".strip()
+    else:
+        m = _URL_RE.search(preview)
+        if m:
+            preview = (preview[:m.start()].rstrip()
+                       + f" [{_cfg()['link_display_text']}]"
+                       + _URL_RE.sub("", preview[m.end():]).strip())
+        else:
+            preview = (preview + f" [{_cfg()['link_display_text']}]").strip()
+
+    print(f"✓ Posted link_post: {preview!r}")
+    if tags:
+        print(f"  Tags: {' '.join('#'+t for t in tags)}")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  MAIN CYCLE
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_once():
-    # Re-read Sheet1 fresh at the top of every cycle so any settings you
-    # changed in Google Sheets (ratios, toggles, link %, report, loop
-    # interval, etc.) apply right away, and check/refresh the cross-repo
-    # posting lock at the same time.
     cfg = refresh_account_config()
 
     if not try_acquire_account_lock():
@@ -1297,12 +1417,36 @@ def run_once():
     if cfg["enable_report"]:
         run_report(client, handle, cfg)
 
+    preferred = choose_media_kind()
+
+    # ── link_post branch — handled entirely separately from the Drive
+    # image/video flow, since a link post has no media file to fetch. ──
+    if preferred == "link_post":
+        entries = load_link_post_plan()
+        if not entries:
+            fallback = random.choice(["image", "video"])
+            print(f"link_post chosen but '{get_link_post_tab_name()}' tab has no "
+                  f"unposted rows (or doesn't exist yet) — falling back to {fallback}.")
+            preferred = fallback
+        else:
+            entry = random.choice(entries)
+            tags  = get_account_hashtags() if cfg["hashtags_enabled_linkpost"] else []
+            try:
+                post_link_post_to_bluesky(client, entry["caption"], tags, card_url=entry.get("url"))
+            except Exception as exc:
+                err = str(exc)
+                if "AccountTakedown" in err or "AccountSuspended" in err:
+                    raise AccountTakenDownError(f"Account {handle} taken down mid-cycle.") from exc
+                raise
+            mark_link_post_posted(entry["row"])
+            return  # link post cycle complete — nothing else to do
+
+    # ── Existing Drive-backed image/video flow ──
     plan = load_post_plan()
     if not plan:
         raise NoMediaFoundError("Post-plan sheet has no usable rows.")
 
-    preferred = choose_media_kind()
-    fallback  = "video" if preferred == "image" else "image"
+    fallback = "video" if preferred == "image" else "image"
 
     file, path, kind, caption, row_num = fetch_media_matching_plan(preferred, plan)
     if not file:
@@ -1318,7 +1462,7 @@ def run_once():
         if kind == "image":
             path = compress_image_under_limit(path)
 
-        cfg = _cfg()  # re-fetch in case the sheet changed between fetch and post
+        cfg = _cfg()
         hashtags_on = cfg["hashtags_enabled_image"] if kind == "image" else cfg["hashtags_enabled_video"]
         tags = get_account_hashtags() if hashtags_on else []
         add_link = should_add_link(kind)
@@ -1381,10 +1525,6 @@ def main():
         except Exception as exc:
             print(f"Error during cycle: {exc}")
 
-        # Loop interval is re-read from the Settings tab every cycle via
-        # refresh_account_config() inside run_once(), so changing
-        # LOOP_INTERVAL_SECONDS in the sheet takes effect on the very next
-        # sleep — no code change or redeploy required.
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
         elapsed   = time.time() - cycle_start
         sleep_for = max(0, loop_interval - elapsed)
