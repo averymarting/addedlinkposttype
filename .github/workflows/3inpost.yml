@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow requests beautifulsoup4
       - name: Run link-card poster loop
-        run: python -u postnow_linkcard.py
+        run: python -u 3inpost.py
         env:
           PYTHONUNBUFFERED: "1"
           # No "|| '1'" fallback on purpose — same reasoning as the media
