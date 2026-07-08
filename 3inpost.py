@@ -282,6 +282,7 @@ def load_account_config(force_refresh=False):
         "hashtags_raw": col("HASHTAGS"),
         "row_num":      ACCOUNT_ROW,
         "hashtags_enabled":    _parse_bool(setting("HASHTAGS_ENABLED"), True),
+        "auto_caption_enabled": _parse_bool(setting("AUTO_CAPTION_ENABLED"), True),
         "link_plan_tab":       setting("LINK_PLAN_SHEET_NAME") or "LinkPlan",
         "loop_interval_seconds": _parse_int(setting("LOOP_INTERVAL_SECONDS"), DEFAULT_LOOP_INTERVAL_SECONDS),
         "preview_timeout":     _parse_int(setting("PREVIEW_FETCH_TIMEOUT"), 15),
@@ -606,9 +607,12 @@ def _compress_thumb(data, max_bytes):
 MAX_POST_GRAPHEMES = 300
 
 def build_caption_text(caption, tags, fallback_url=None):
-    text = _URL_RE.sub("", caption or "").strip()
+    # NOTE: strip only spaces/tabs here, not newlines — compose_fallback_caption
+    # intentionally prepends a leading "\n" before the title, and a plain
+    # .strip() would silently remove it.
+    text = _URL_RE.sub("", caption or "").strip(" \t\r")
     if fallback_url:
-        text = f"{text}\n{fallback_url}".strip() if text else fallback_url
+        text = f"{text}\n{fallback_url}".strip(" \t\r") if text else fallback_url
 
     tb = TextBuilder()
     if text:
@@ -655,17 +659,24 @@ def build_external_embed(client, preview, max_thumb_bytes, timeout):
 
 def compose_fallback_caption(preview):
     """When the sheet has no Caption for a row, build one from the fetched
-    preview instead: og:title on its own line, a blank line, then the
-    og:description/twitter:description below it. Hashtags get appended
-    after this block by build_caption_text, also separated by a blank line."""
+    preview instead:
+        <blank line>
+        <og:title>
+        <og:description / twitter:description>
+    i.e. one leading blank line before the title, then title and
+    description directly underneath each other with no blank line between
+    them. Hashtags still get appended after this block by
+    build_caption_text, separated from it by a blank line."""
     if not preview:
         return ""
     title = (preview.get("title") or "").strip()
     description = (preview.get("description") or "").strip()
     parts = [p for p in (title, description) if p]
-    return "\n\n".join(parts)
+    if not parts:
+        return ""
+    return "\n" + "\n".join(parts)
 
-def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
+def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes, auto_caption_enabled=True):
     print(f"Fetching preview for: {url}")
     preview = None
     embed = None
@@ -682,11 +693,13 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
 
     used_auto_caption = False
     effective_caption = caption
-    if not effective_caption and preview:
+    if not effective_caption and preview and auto_caption_enabled:
         effective_caption = compose_fallback_caption(preview)
         used_auto_caption = bool(effective_caption)
         if used_auto_caption:
             print("No Caption in sheet — using title + description from the preview instead.")
+    elif not effective_caption and preview and not auto_caption_enabled:
+        print("No Caption in sheet and AUTO_CAPTION_ENABLED is off — posting without a caption.")
 
     tb = build_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
@@ -744,7 +757,8 @@ def run_once():
 
     try:
         post_link_card(client, entry["url"], entry["caption"], tags,
-                        cfg["preview_timeout"], cfg["max_thumb_bytes"])
+                        cfg["preview_timeout"], cfg["max_thumb_bytes"],
+                        auto_caption_enabled=cfg["auto_caption_enabled"])
     except Exception as exc:
         err = str(exc)
         release_url_claim(sheets_service, entry)
@@ -767,6 +781,7 @@ def main():
 
     cfg = _cfg()
     print(f"Account row {cfg['row_num']} | hashtags_enabled={cfg['hashtags_enabled']} | "
+          f"auto_caption_enabled={cfg['auto_caption_enabled']} | "
           f"link_plan_tab={cfg['link_plan_tab']} | loop_interval={cfg['loop_interval_seconds']}s")
 
     while True:
