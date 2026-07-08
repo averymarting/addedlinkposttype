@@ -653,6 +653,18 @@ def build_external_embed(client, preview, max_thumb_bytes, timeout):
         )
     )
 
+def compose_fallback_caption(preview):
+    """When the sheet has no Caption for a row, build one from the fetched
+    preview instead: og:title on its own line, a blank line, then the
+    og:description/twitter:description below it. Hashtags get appended
+    after this block by build_caption_text, also separated by a blank line."""
+    if not preview:
+        return ""
+    title = (preview.get("title") or "").strip()
+    description = (preview.get("description") or "").strip()
+    parts = [p for p in (title, description) if p]
+    return "\n\n".join(parts)
+
 def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
     print(f"Fetching preview for: {url}")
     preview = None
@@ -668,12 +680,21 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
         # retrying the same broken preview.
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
-    tb = build_caption_text(caption, tags, fallback_url=(url if preview is None else None))
+    used_auto_caption = False
+    effective_caption = caption
+    if not effective_caption and preview:
+        effective_caption = compose_fallback_caption(preview)
+        used_auto_caption = bool(effective_caption)
+        if used_auto_caption:
+            print("No Caption in sheet — using title + description from the preview instead.")
+
+    tb = build_caption_text(effective_caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
 
     posted_url = preview["final_url"] if preview else url
+    caption_source = "auto (title+description)" if used_auto_caption else ("sheet" if caption else "no")
     print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
-          f"(caption={'yes' if caption else 'no'}, tags={len(tags)})")
+          f"(caption={caption_source}, tags={len(tags)})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
