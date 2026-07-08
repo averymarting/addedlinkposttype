@@ -87,13 +87,27 @@ _URL_RE = re.compile(r"https?://\S+")
 DEFAULT_LOOP_INTERVAL_SECONDS = 900
 CLAIM_PREFIX = "CLAIMED_"  # used inside the Status cell to soft-lock a row while posting
 
+# Shared, browser-like headers used for every outbound preview/thumbnail
+# fetch. Sites that front themselves with link-shortener/redirector logic
+# (e.g. foodiesposts.com/xxxxx) commonly return 415/403 to requests that
+# only send a bare User-Agent with no Accept/Accept-Language — this fuller
+# set of headers makes the request look like a normal browser navigation.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  GOOGLE CREDENTIALS  (identical approach to postnow_status_post.py)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _scrape_google_token(url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    headers = dict(BROWSER_HEADERS)
     if GOOGLE_TOKEN_SHARED_TOKEN:
         headers["Authorization"] = f"Bearer {GOOGLE_TOKEN_SHARED_TOKEN}"
     resp = requests.get(url, headers=headers, timeout=15)
@@ -431,15 +445,53 @@ def release_url_claim(service, entry):
 # ═══════════════════════════════════════════════════════════════════════════
 #  LINK PREVIEW (og:title / og:description / og:image) — mimics what
 #  Bluesky itself does the moment you paste a URL into the composer.
+#
+#  FIX: many link-shortener/redirector domains (e.g. foodiesposts.com/xxxx)
+#  return 415/403 to bare-bones requests. Sending a fuller, browser-like
+#  header set (Accept / Accept-Language, plus a modern Chrome UA) resolves
+#  most of these. We also do a manual redirect walk with the SAME headers
+#  on every hop, since some redirectors serve the first response fine but
+#  reject the final destination fetch if headers look automated there.
 # ═══════════════════════════════════════════════════════════════════════════
 
 class NoPreviewError(Exception):
     pass
 
-def fetch_link_preview(url, timeout):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+def _get_with_browser_headers(url, timeout, max_redirects=5):
+    """GET a URL manually following redirects, sending full browser-like
+    headers on every hop (some sites only 415/403 on later hops)."""
+    session = requests.Session()
+    current_url = url
+    last_exc = None
+    for _ in range(max_redirects + 1):
+        try:
+            resp = session.get(
+                current_url, headers=BROWSER_HEADERS, timeout=timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            last_exc = exc
+            break
+
+        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            if not location:
+                break
+            from urllib.parse import urljoin
+            current_url = urljoin(current_url, location)
+            continue
+
+        resp.raise_for_status()
+        return resp
+
+    # Fall back to letting requests handle redirects itself in case our
+    # manual walk above missed something (belt-and-braces).
+    resp = session.get(url, headers=BROWSER_HEADERS, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
+    return resp
+
+def fetch_link_preview(url, timeout):
+    resp = _get_with_browser_headers(url, timeout)
     soup = BeautifulSoup(resp.text, "html.parser")
 
     def meta(*props):
@@ -461,8 +513,7 @@ def fetch_link_preview(url, timeout):
 
 def download_thumb(image_url, max_bytes, timeout):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(image_url, headers=headers, timeout=timeout)
+        resp = requests.get(image_url, headers=BROWSER_HEADERS, timeout=timeout)
         resp.raise_for_status()
         data = resp.content
         if len(data) <= max_bytes:
@@ -485,13 +536,17 @@ def download_thumb(image_url, max_bytes, timeout):
 # ═══════════════════════════════════════════════════════════════════════════
 #  POST BUILDING — strip the raw URL out of the caption (the preview card
 #  replaces it, same as pasting a link into the Bluesky app does), then
-#  append hashtags if enabled.
+#  append hashtags if enabled. If there's no card (preview fetch failed),
+#  keep the URL in the text so the post is still a usable link.
 # ═══════════════════════════════════════════════════════════════════════════
 
 MAX_POST_GRAPHEMES = 300
 
-def build_caption_text(caption, tags):
+def build_caption_text(caption, tags, fallback_url=None):
     text = _URL_RE.sub("", caption or "").strip()
+    if fallback_url:
+        text = f"{text}\n{fallback_url}".strip() if text else fallback_url
+
     tb = TextBuilder()
     if text:
         tb.text(text)
@@ -539,12 +594,24 @@ def build_external_embed(client, preview, max_thumb_bytes, timeout):
 
 def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
     print(f"Fetching preview for: {url}")
-    preview = fetch_link_preview(url, timeout)
-    print(f"  title: {preview['title']!r}")
-    embed = build_external_embed(client, preview, max_thumb_bytes, timeout)
-    tb = build_caption_text(caption, tags)
+    preview = None
+    embed = None
+    try:
+        preview = fetch_link_preview(url, timeout)
+        print(f"  title: {preview['title']!r}")
+        embed = build_external_embed(client, preview, max_thumb_bytes, timeout)
+    except Exception as exc:
+        # Don't let a bad preview fetch (415/403/timeout/etc.) kill the
+        # whole post — fall back to a plain post that still includes the
+        # link as text, so the cycle succeeds and the row gets marked
+        # posted instead of endlessly retrying the same broken preview.
+        print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
+
+    tb = build_caption_text(caption, tags, fallback_url=(url if preview is None else None))
     client.send_post(text=tb, embed=embed)
-    print(f"✓ Posted link card for {preview['final_url']} "
+
+    posted_url = preview["final_url"] if preview else url
+    print(f"✓ Posted {'link card' if embed else 'plain link'} for {posted_url} "
           f"(caption={'yes' if caption else 'no'}, tags={len(tags)})")
 
 
