@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 import requests
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
@@ -87,12 +88,9 @@ _URL_RE = re.compile(r"https?://\S+")
 DEFAULT_LOOP_INTERVAL_SECONDS = 900
 CLAIM_PREFIX = "CLAIMED_"  # used inside the Status cell to soft-lock a row while posting
 
-# Shared, browser-like headers used for every outbound preview/thumbnail
-# fetch. Sites that front themselves with link-shortener/redirector logic
-# (e.g. foodiesposts.com/xxxxx) commonly return 415/403 to requests that
-# only send a bare User-Agent with no Accept/Accept-Language — this fuller
-# set of headers makes the request look like a normal browser navigation.
-BROWSER_HEADERS = {
+# Shared, browser-like headers used for the manual-scrape fallback and the
+# thumbnail download.
+REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -100,6 +98,11 @@ BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+# kept for backwards-compat with the previous revision of this file
+BROWSER_HEADERS = REQUEST_HEADERS
+
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds; doubles each retry (2, 4, 8...)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -443,81 +446,141 @@ def release_url_claim(service, entry):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  LINK PREVIEW (og:title / og:description / og:image) — mimics what
-#  Bluesky itself does the moment you paste a URL into the composer.
+#  LINK PREVIEW (og:title / og:description / og:image)
 #
-#  FIX: many link-shortener/redirector domains (e.g. foodiesposts.com/xxxx)
-#  return 415/403 to bare-bones requests. Sending a fuller, browser-like
-#  header set (Accept / Accept-Language, plus a modern Chrome UA) resolves
-#  most of these. We also do a manual redirect walk with the SAME headers
-#  on every hop, since some redirectors serve the first response fine but
-#  reject the final destination fetch if headers look automated there.
+#  PRIMARY PATH: Bluesky's own card-generation service, cardyb
+#  (https://cardyb.bsky.app/v1/extract). This is the SAME backend the
+#  official Bluesky app/web client hits when you paste a link into the
+#  composer, so it already handles JS-rendered OG tags, redirects, and
+#  hotlink protection the way a "real" Bluesky post does. This is what
+#  fixes the "works sometimes, not others" inconsistency you'd get from
+#  scraping pages ourselves (415s from redirector domains, protected
+#  images, relative image paths, etc.).
+#
+#  FALLBACK PATH: if cardyb is unreachable or returns nothing usable
+#  after retries, fall back to manually scraping the page's own <meta>
+#  tags (old behavior), using the final post-redirect URL to resolve any
+#  relative image paths.
 # ═══════════════════════════════════════════════════════════════════════════
+
+CARDYB_EXTRACT_URL = "https://cardyb.bsky.app/v1/extract"
 
 class NoPreviewError(Exception):
     pass
 
-def _get_with_browser_headers(url, timeout, max_redirects=5):
-    """GET a URL manually following redirects, sending full browser-like
-    headers on every hop (some sites only 415/403 on later hops)."""
-    session = requests.Session()
-    current_url = url
+def fetch_link_metadata(url, timeout=20):
+    """Get link-preview metadata via cardyb first, falling back to a
+    manual scrape of the page if cardyb can't produce anything usable."""
     last_exc = None
-    for _ in range(max_redirects + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = session.get(
-                current_url, headers=BROWSER_HEADERS, timeout=timeout,
-                allow_redirects=False,
+            resp = requests.get(
+                CARDYB_EXTRACT_URL,
+                params={"url": url},
+                headers=REQUEST_HEADERS,
+                timeout=timeout,
             )
-        except requests.RequestException as exc:
+            resp.raise_for_status()
+            data = resp.json()
+            # cardyb's "image" field is already a fully-qualified, proxied
+            # URL (https://cardyb.bsky.app/v1/image?...) — no need to
+            # resolve relative paths or worry about hotlink protection.
+            return {
+                "title": (data.get("title") or url)[:300],
+                "description": (data.get("description") or "")[:1000],
+                "image": data.get("image") or None,
+                "final_url": url,
+            }
+        except (requests.exceptions.RequestException, ValueError) as exc:
             last_exc = exc
-            break
+            print(f"Attempt {attempt}/{MAX_RETRIES} to fetch via cardyb failed: {exc}")
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
 
-        if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("Location")
-            if not location:
-                break
-            from urllib.parse import urljoin
-            current_url = urljoin(current_url, location)
-            continue
+    print(f"cardyb extraction failed after {MAX_RETRIES} attempts ({last_exc}); falling back to manual scrape.")
+    return _fetch_link_metadata_manual(url, timeout)
 
-        resp.raise_for_status()
-        return resp
+def _fetch_link_metadata_manual(url, timeout=20):
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, allow_redirects=True)
+            resp.raise_for_status()
+            return _parse_metadata(resp)
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            print(f"Attempt {attempt}/{MAX_RETRIES} to manually fetch {url} failed: {exc}")
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
 
-    # Fall back to letting requests handle redirects itself in case our
-    # manual walk above missed something (belt-and-braces).
-    resp = session.get(url, headers=BROWSER_HEADERS, timeout=timeout, allow_redirects=True)
-    resp.raise_for_status()
-    return resp
+    raise NoPreviewError(f"Failed to fetch {url} after {MAX_RETRIES} attempts (cardyb + manual)") from last_exc
 
-def fetch_link_preview(url, timeout):
-    resp = _get_with_browser_headers(url, timeout)
+def _parse_metadata(resp):
     soup = BeautifulSoup(resp.text, "html.parser")
+    # Use the FINAL url (after redirects) as the base for resolving any
+    # relative image paths.
+    final_url = resp.url
 
     def meta(*props):
-        for p in props:
-            tag = soup.find("meta", property=p) or soup.find("meta", attrs={"name": p})
+        for prop in props:
+            tag = soup.find("meta", property=prop) or soup.find("meta", attrs={"name": prop})
             if tag and tag.get("content"):
                 return tag["content"].strip()
-        return ""
+        return None
 
-    title = meta("og:title", "twitter:title") or (soup.title.string.strip() if soup.title and soup.title.string else url)
-    description = meta("og:description", "twitter:description", "description")
-    image = meta("og:image", "twitter:image")
+    title = meta("og:title", "twitter:title") or (
+        soup.title.string.strip() if soup.title and soup.title.string else resp.url
+    )
+    description = meta("og:description", "twitter:description", "description") or ""
+    raw_image = meta("og:image", "og:image:url", "twitter:image")
+    image = urljoin(final_url, raw_image) if raw_image else None
 
-    if image and not image.startswith("http"):
-        from urllib.parse import urljoin
-        image = urljoin(resp.url, image)
+    return {"title": title[:300], "description": description[:1000], "image": image, "final_url": final_url}
 
-    return {"title": title[:300], "description": description[:1000], "image": image, "final_url": resp.url}
+def upload_thumbnail(client, image_url, referer, max_bytes, timeout=20):
+    """Download the preview image (if any) and upload it as a blob for the
+    card, retrying transient failures and shrinking it if it's over the
+    blob size limit."""
+    if not image_url:
+        print("No preview image found — posting without a thumbnail.")
+        return None
 
-def download_thumb(image_url, max_bytes, timeout):
+    headers = {**REQUEST_HEADERS, "Referer": referer}
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            img_resp = requests.get(image_url, headers=headers, timeout=timeout)
+            img_resp.raise_for_status()
+            content_type = img_resp.headers.get("Content-Type", "")
+            if "image" not in content_type:
+                print(f"Warning: fetched image URL did not return an image (Content-Type: {content_type!r})")
+                return None
+
+            data = img_resp.content
+            if len(data) > max_bytes:
+                data = _compress_thumb(data, max_bytes)
+                if data is None:
+                    return None
+
+            upload = client.upload_blob(data)
+            return upload.blob
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"Attempt {attempt}/{MAX_RETRIES} to fetch/upload thumbnail failed: {exc}")
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY * (2 ** (attempt - 1))
+                print(f"Retrying in {delay}s…")
+                time.sleep(delay)
+
+    print(f"Warning: thumbnail could not be fetched/uploaded after all retries ({last_exc}); posting without one.")
+    return None
+
+def _compress_thumb(data, max_bytes):
     try:
-        resp = requests.get(image_url, headers=BROWSER_HEADERS, timeout=timeout)
-        resp.raise_for_status()
-        data = resp.content
-        if len(data) <= max_bytes:
-            return data, resp.headers.get("Content-Type", "image/jpeg")
         from PIL import Image
         img = Image.open(io.BytesIO(data))
         if img.mode in ("RGBA", "P", "LA"):
@@ -526,11 +589,11 @@ def download_thumb(image_url, max_bytes, timeout):
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=q, optimize=True)
             if buf.tell() <= max_bytes:
-                return buf.getvalue(), "image/jpeg"
-        return buf.getvalue(), "image/jpeg"
+                return buf.getvalue()
+        return buf.getvalue()
     except Exception as exc:
-        print(f"Warning: could not fetch/compress thumbnail: {exc}")
-        return None, None
+        print(f"Warning: could not compress thumbnail: {exc}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -577,12 +640,10 @@ def build_caption_text(caption, tags, fallback_url=None):
     return tb
 
 def build_external_embed(client, preview, max_thumb_bytes, timeout):
-    thumb_blob = None
-    if preview["image"]:
-        data, mime = download_thumb(preview["image"], max_thumb_bytes, timeout)
-        if data:
-            upload = client.upload_blob(data)
-            thumb_blob = upload.blob
+    thumb_blob = upload_thumbnail(
+        client, preview["image"], referer=preview["final_url"],
+        max_bytes=max_thumb_bytes, timeout=timeout,
+    )
     return models.AppBskyEmbedExternal.Main(
         external=models.AppBskyEmbedExternal.External(
             uri=preview["final_url"],
@@ -597,14 +658,14 @@ def post_link_card(client, url, caption, tags, timeout, max_thumb_bytes):
     preview = None
     embed = None
     try:
-        preview = fetch_link_preview(url, timeout)
+        preview = fetch_link_metadata(url, timeout)
         print(f"  title: {preview['title']!r}")
         embed = build_external_embed(client, preview, max_thumb_bytes, timeout)
     except Exception as exc:
-        # Don't let a bad preview fetch (415/403/timeout/etc.) kill the
-        # whole post — fall back to a plain post that still includes the
-        # link as text, so the cycle succeeds and the row gets marked
-        # posted instead of endlessly retrying the same broken preview.
+        # Don't let a bad preview fetch kill the whole post — fall back to
+        # a plain post that still includes the link as text, so the cycle
+        # succeeds and the row gets marked posted instead of endlessly
+        # retrying the same broken preview.
         print(f"Warning: preview fetch failed ({exc}); posting as plain link instead.")
 
     tb = build_caption_text(caption, tags, fallback_url=(url if preview is None else None))
